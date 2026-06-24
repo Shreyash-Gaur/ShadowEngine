@@ -32,8 +32,6 @@ MAX_TOKENS       = int(os.getenv("MAX_TOKENS", "4096"))
 TEMPERATURE      = float(os.getenv("TEMPERATURE", "0.7"))
 DEFAULT_API_BASE = os.getenv("API_URL_BASE", "http://127.0.0.1:8000")
 
-# FIX 1: PROMPT_TEXT was defined but DEFAULT_MSGS was always used.
-#         Now both share the same prompt so reported token counts are consistent.
 PROMPT_TEXT = os.getenv(
     "BENCH_PROMPT",
     "Write a poem on Qwen architecture of around 10 lines."
@@ -41,7 +39,7 @@ PROMPT_TEXT = os.getenv(
 
 DEFAULT_MSGS = [
     {"role": "system", "content": "You are a helpful assistant."},
-    {"role": "user",   "content": PROMPT_TEXT},   # was hardcoded 4-line poem
+    {"role": "user",   "content": PROMPT_TEXT},
 ]
 
 
@@ -55,8 +53,8 @@ class RequestResult:
     index:       int
     status_code: int   = 0
     latency_ms:  float = 0.0
-    ttft_ms:     float = 0.0   # FIX 2: was declared but never populated; now measured via streaming
-    token_count: int   = 0     # FIX 3: was len(text.split()) — now counted from stream chunks
+    ttft_ms:     float = 0.0
+    token_count: int   = 0
     error:       str   = ""
 
 
@@ -76,12 +74,12 @@ def make_chat_request(url: str, index: int, msgs: Optional[list] = None) -> Requ
     msgs   = msgs or DEFAULT_MSGS
 
     payload = {
-        "model":       MODEL,
-        "messages":    msgs,
-        "temperature": TEMPERATURE,
-        "top_p":       0.9,
-        "max_tokens":  MAX_TOKENS,
-        "stream":      True,   # FIX 2: switched to streaming for real TTFT
+        "model":          MODEL,
+        "messages":       msgs,
+        "temperature":    TEMPERATURE,
+        "top_p":          0.9,
+        "max_tokens":     MAX_TOKENS,
+        "stream":         True,
         "stream_options": {"include_usage": True},
     }
 
@@ -99,6 +97,7 @@ def make_chat_request(url: str, index: int, msgs: Optional[list] = None) -> Requ
 
         first_token_at = None
         token_count    = 0
+        last_data      = None  # tracks last parsed chunk so usage is accessible after loop
 
         for line in resp.iter_lines():
             if not line:
@@ -110,9 +109,10 @@ def make_chat_request(url: str, index: int, msgs: Optional[list] = None) -> Requ
             if data_str == "[DONE]":
                 break
             try:
-                data  = json.loads(data_str)
-                delta = data["choices"][0]["delta"]
-            except (json.JSONDecodeError, KeyError):
+                data      = json.loads(data_str)
+                last_data = data                       # keep reference to last parsed chunk
+                delta     = data["choices"][0]["delta"]
+            except (json.JSONDecodeError, KeyError, IndexError):
                 continue
 
             text = delta.get("content") or delta.get("reasoning_content") or ""
@@ -121,21 +121,21 @@ def make_chat_request(url: str, index: int, msgs: Optional[list] = None) -> Requ
 
             now = time.perf_counter()
             if first_token_at is None:
-                first_token_at = now          # first real content token
-            token_count += 1                  # FIX 3: count stream chunks, not word split
+                first_token_at = now
+            token_count += 1
 
         end_time = time.perf_counter()
 
+        if last_data:
+            usage = last_data.get("usage")
+            if usage and usage.get("completion_tokens"):
+                token_count = usage["completion_tokens"]
+
         if first_token_at is not None:
-            result.ttft_ms    = (first_token_at  - request_sent_at) * 1000  # FIX 2
+            result.ttft_ms    = (first_token_at - request_sent_at) * 1000
         result.latency_ms     = (end_time        - request_sent_at) * 1000
         result.token_count    = max(token_count, 1)
 
-     # ── FIX: override chunk-count with real BPE token count ──────────
-        usage = data.get("usage")
-        if usage and usage.get("completion_tokens"):
-            token_count = usage["completion_tokens"]
-            
     except Exception as e:
         result.latency_ms = (time.perf_counter() - request_sent_at) * 1000
         result.error      = str(e)
@@ -148,7 +148,6 @@ def make_chat_request(url: str, index: int, msgs: Optional[list] = None) -> Requ
 # ─────────────────────────────────────────────
 
 def health_check(url: str) -> bool:
-    import requests as req
     try:
         resp = req.get(f"{url}/health", auth=AUTH, timeout=10)
         return resp.status_code == 200
@@ -202,32 +201,31 @@ def run_benchmark(url: str, n_requests: int = 10, concurrent: int = 4) -> None:
         s = sorted(vals)
         return s[max(0, int(p * len(s)) - 1)]
 
-    total_tokens   = sum(tokens)
-    rps            = len(successful) / total_time_s
-    system_tps     = total_tokens    / total_time_s   # FIX 3: actual stream-chunk tokens
+    total_tokens = sum(tokens)
+    rps          = len(successful) / total_time_s
+    system_tps   = total_tokens    / total_time_s
 
     print(f"  Results : {len(successful)} successful, {len(failed)} failed\n")
 
     print(f"  E2E Latency (ms)")
     print(f"    avg  {statistics.mean(latencies):>8.1f}  |  min  {min(latencies):>8.1f}  |  max  {max(latencies):>8.1f}")
-    print(f"    p50  {pct(latencies, .50):>8.1f}  |  p90  {pct(latencies, .90):>8.1f}  |  p99  {pct(latencies, .99):>8.1f}")  # FIX 4: added p90/p99
+    print(f"    p50  {pct(latencies, .50):>8.1f}  |  p90  {pct(latencies, .90):>8.1f}  |  p99  {pct(latencies, .99):>8.1f}")
     print()
 
     if ttfts:
-        print(f"  TTFT (ms)")                         # FIX 2: now actually populated
+        print(f"  TTFT (ms)")
         print(f"    avg  {statistics.mean(ttfts):>8.1f}  |  min  {min(ttfts):>8.1f}  |  max  {max(ttfts):>8.1f}")
         print(f"    p50  {pct(ttfts, .50):>8.1f}  |  p90  {pct(ttfts, .90):>8.1f}  |  p99  {pct(ttfts, .99):>8.1f}")
         print()
 
     print(f"  Throughput")
     print(f"    RPS (requests/sec) : {rps:>8.3f}")
-    print(f"    System TPS (tok/s) : {system_tps:>8.2f}")   # FIX 3
+    print(f"    System TPS (tok/s) : {system_tps:>8.2f}")
     print(f"    Avg tokens / req   : {total_tokens / len(successful):>8.1f}")
     print(f"    Total tokens       : {total_tokens:>8d}")
     print(f"    Wall time          : {total_time_s:>8.2f}s")
     print()
 
-    # Per-request detail (last 5)
     sorted_results = sorted(successful, key=lambda r: r.index)
     show = sorted_results[-min(5, len(sorted_results)):]
     print(f"  {'Last' if len(successful) > 5 else 'All'} {len(show)} requests:")
@@ -243,12 +241,10 @@ def run_benchmark(url: str, n_requests: int = 10, concurrent: int = 4) -> None:
 
 def main() -> None:
     parser = argparse.ArgumentParser(description="ShadowEngine API benchmark")
-    parser.add_argument("--endpoint",   default=DEFAULT_API_BASE, help="Base URL of the server")
-    parser.add_argument("--requests",   "-n", type=int, default=10, help="Number of requests (default: 10)")
+    parser.add_argument("--endpoint",     default=DEFAULT_API_BASE, help="Base URL of the server")
+    parser.add_argument("--requests", "-n", type=int, default=10,   help="Number of requests (default: 10)")
     parser.add_argument("--concurrent", "-c", type=int, default=4,  help="Concurrent connections (default: 4)")
     parser.add_argument("--no-benchmark", action="store_true",      help="Skip benchmark, health check only")
-    # FIX 5: removed --benchmark flag and `or True` hack; benchmark runs by default,
-    #         use --no-benchmark to skip it. Flag is now meaningful.
     args = parser.parse_args()
 
     base_url = args.endpoint.rstrip("/")
@@ -260,7 +256,7 @@ def main() -> None:
         sys.exit(1)
     print("  ✅ Server is healthy!\n")
 
-    if not args.no_benchmark:          # FIX 5: clean flag logic
+    if not args.no_benchmark:
         run_benchmark(
             base_url,
             n_requests=args.requests,
