@@ -26,9 +26,9 @@ MAX_TOKENS  = int(os.getenv("MAX_TOKENS", "8192"))
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0.7"))
 
 # SLA thresholds — override via .env
-SLA_TTFT_MS = float(os.getenv("SLA_TTFT_MS", "2000"))   # 2 seconds
-SLA_TPOT_MS = float(os.getenv("SLA_TPOT_MS", "100"))    # 100 ms per output token
-SLA_E2E_MS  = float(os.getenv("SLA_E2E_MS",  "30000"))  # 30 seconds end-to-end
+SLA_TTFT_MS = float(os.getenv("SLA_TTFT_MS", "3000"))   # 3 seconds
+SLA_TPOT_MS = float(os.getenv("SLA_TPOT_MS", "20"))    # 20 ms per output token
+SLA_E2E_MS  = float(os.getenv("SLA_E2E_MS",  "50000"))  # 50 seconds end-to-end
 
 PROMPT = os.getenv(
     "BENCH_PROMPT",
@@ -75,11 +75,20 @@ def run_single_request(verbose: bool = True) -> dict:
             break
 
         try:
-            data  = json.loads(data_str)
-            delta = data["choices"][0]["delta"]
+            data = json.loads(data_str)
+
+            usage = data.get("usage")
+            if usage:
+                token_count = usage.get("completion_tokens", token_count)
+
+            choices = data.get("choices")
+            if not choices:
+                continue
+
+            delta = choices[0].get("delta", {})
 
             reasoning_text = delta.get("reasoning_content", "")
-            content_text   = delta.get("content", "")
+            content_text = delta.get("content", "")
 
             if reasoning_text:
                 if not is_thinking:
