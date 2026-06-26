@@ -88,4 +88,4 @@ if __name__ == "__main__":
     print("REMOTE_HOST =", REMOTE_HOST)
     print("AUTH_USER =", AUTH_USER)
     print("AUTH_PASS set =", bool(AUTH_PASS))
-    app.run(host="127.0.0.1", port=LOCAL_PORT, debug=False)
+    app.run(host="127.0.0.1", port=LOCAL_PORT, debug=False, threaded=True)

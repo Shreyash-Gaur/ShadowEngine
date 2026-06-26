@@ -74,7 +74,8 @@ def universal_proxy(path):
         return Response(
             remote_response.iter_content(chunk_size=None), 
             status=remote_response.status_code,
-            headers=response_headers
+            headers=response_headers,
+            direct_passthrough=True,
         )
 
     except requests.exceptions.RequestException as e:
