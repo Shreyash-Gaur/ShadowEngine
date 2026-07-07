@@ -59,20 +59,19 @@ BASIC_AUTH_PASS = _get_secret("BASIC_AUTH_PASS", fallback="YOUR_AUTH_PASSWORD")
  
 CONFIG: Dict[str, Any] = {
     "model": {
-        "name": "Lorbus/Qwen3.6-27B-int4-AutoRound",
+        "name": "shieldstar/Qwen3.6-35B-A3B-int4-AutoRound-EC",
         "dtype": "float16",             # Forced FP16 for T4 compatibility
         "quantization": None,           # Native INT4 math
-        "max_model_len": 8192,          # 32k context window
-        "gpu_memory_utilization": 0.94, # High utilization to maximize KV Cache
+        "max_model_len": 262144,        # 256k context window
+        "gpu_memory_utilization": 0.95, # High utilization to maximize KV Cache
         "trust_remote_code": True,
         "tokenizer_mode": "auto",
         "tensor_parallel_size": 2,      # Splitting across both T4s
-        "max_num_seqs": 3,              # Dedicated single-stream processing
-
+        "max_num_seqs": 6,              # Dedicated single-stream processing
         # DOES NOT SUPPORT FP8 math If you force vLLM to use FP8 KV cache,
         # it will emulate the decompression in software, causing inference to crawl.
 
-        # "kv_cache_dtype": "fp8",         # Reduces KV memory footprint for 128K attempts 
+        # "kv_cache_dtype": "fp8",         # Reduces KV memory footprint for 256K attempts 
         # "calculate_kv_scales": True,     # Better than fixed 1.0 scales for FP8 KV
         # "reasoning_parser": "qwen3",     # It processes the thinking block internally but only returns the final, clean answer to your API request.
     },
@@ -249,12 +248,12 @@ class VLLMServer:
         cmd = [
             sys.executable, "-m", "vllm.entrypoints.openai.api_server",
             "--model", model_cfg["name"],
-            "--served-model-name", model_cfg["name"], "Qwen3.6-27B",
+            "--served-model-name", model_cfg["name"], "Qwen3.6-35B-A3B",
             "--host", serve_cfg["host"],
             "--port", str(serve_cfg["port"]),
             "--dtype", model_cfg.get("dtype", "float16"),
-            "--max-model-len", str(model_cfg.get("max_model_len", 8192)),
-            "--gpu-memory-utilization", str(model_cfg.get("gpu_memory_utilization", 0.94)),
+            "--max-model-len", str(model_cfg.get("max_model_len", 262144)),
+            "--gpu-memory-utilization", str(model_cfg.get("gpu_memory_utilization", 0.95)),
             "--tokenizer-mode", model_cfg.get("tokenizer_mode", "auto"),
             "--tensor-parallel-size", str(tp_size),
             "--attention-backend", "TRITON_ATTN",
@@ -435,8 +434,8 @@ _SERVER: Optional[VLLMServer] = None  # set in main() so the kill switch can rea
  
  
 def kill_switch_loop() -> None:
-    send_log("Kill-switch listener online. Send 'SHUTDOWN_GPU' to terminate GPU.", priority=2)
-    logging.info(f"Kill-switch listener online. Send 'SHUTDOWN_GPU' to ntfy.sh/{NTFY_CHANNEL} to terminate.")
+    send_log("Kill-switch listener online. Send 'SHUTDOWN_vLLM' to terminate GPU.", priority=2)
+    logging.info(f"Kill-switch listener online. Send 'SHUTDOWN_vLLM' to ntfy.sh/{NTFY_CHANNEL} to terminate.")
     url = f"https://ntfy.sh/{NTFY_CHANNEL}/raw"
 
     while True:
@@ -446,7 +445,7 @@ def kill_switch_loop() -> None:
                 if not line:
                     continue
                 decoded = line.decode("utf-8", errors="ignore")
-                if "SHUTDOWN_GPU" in decoded:
+                if "SHUTDOWN_vLLM" in decoded:
                     send_log("Kill switch activated! Shutting down GPU session...", priority=5)
                     logging.warning("Kill switch activated remotely! Shutting down GPU session...")
                     if _SERVER is not None:
