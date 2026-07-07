@@ -178,7 +178,7 @@ def install_deps() -> None:
     export LDFLAGS="-L/usr/local/cuda/lib64/stubs -L/usr/local/nvidia/lib64"
     
     # 2. Clone the official repository
-    git clone --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
+    git clone --branch b9780 --depth 1 https://github.com/ggml-org/llama.cpp.git /tmp/llama.cpp
     cd /tmp/llama.cpp
     
     # 3. Build with CUDA enabled specifically for Compute Capability 75 (Tesla T4) and Disabled UI
@@ -248,6 +248,7 @@ class LlamaServer:
         # Construct the llama-server launch command based on the Reddit spec
         cmd = [
             "llama-server",
+            "-lv", "1",                   # Uses the verbosity flag (-lv 1) to hide all the INFO and WAR
             "--model", model_path,
             "--alias", model_cfg["alias"],
             "--ctx-size", str(model_cfg["ctx_size"]),
@@ -404,8 +405,8 @@ class LlamaServer:
 _SERVER: Optional[LlamaServer] = None
  
 def kill_switch_loop() -> None:
-    send_log("Kill-switch listener online. Send 'SHUTDOWN_GPU' to terminate GPU.", priority=2)
-    logging.info(f"Kill-switch listener online. Send 'SHUTDOWN_GPU' to ntfy.sh/{NTFY_CHANNEL} to terminate.")
+    send_log("Kill-switch listener online. Send 'SHUTDOWN_llama' to terminate GPU.", priority=2)
+    logging.info(f"Kill-switch listener online. Send 'SHUTDOWN_llama' to ntfy.sh/{NTFY_CHANNEL} to terminate.")
     url = f"https://ntfy.sh/{NTFY_CHANNEL}/raw"
     while True:
         try:
@@ -414,7 +415,7 @@ def kill_switch_loop() -> None:
                 if not line:
                     continue
                 decoded = line.decode("utf-8", errors="ignore")
-                if "SHUTDOWN_GPU" in decoded:
+                if "SHUTDOWN_llama" in decoded:
                     send_log("Kill switch activated! Shutting down GPU session...", priority=5)
                     logging.warning("Kill switch activated remotely! Shutting down GPU session...")
                     if _SERVER is not None:
