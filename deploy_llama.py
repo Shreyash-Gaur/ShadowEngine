@@ -421,7 +421,9 @@ def kill_switch_loop() -> None:
                     if _SERVER is not None:
                         _SERVER.shutdown()
                     os._exit(0)
-        except Exception:
+        except Exception as e:
+            send_log(f"Kill-switch listener dropped ({e}) — reconnecting in 5s", priority=2)
+            logging.warning(f"Kill-switch listener dropped ({e}) — reconnecting in 5s")
             time.sleep(5)
  
 # =============================================================================
