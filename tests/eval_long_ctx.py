@@ -11,6 +11,20 @@ Usage:
     python eval_long_ctx.py --ctx 192000 --suite all --checkpoint ./ckpt.json --save-results
     python eval_long_ctx.py --ctx 65536 --suite all --no-wiki          # skip Wikipedia, use static filler
     python eval_long_ctx.py --ctx 65536 --suite all --wiki-sentences 40000
+    python eval_long_ctx.py --ctx 65536 --suite all --temperature 0.7 --samples 5 \
+        --checkpoint ./ckpt_sampled.json     # pass-rate mode -- see "Sampling" below
+
+Sampling (quality-under-compression checks, not the default production mode):
+    --temperature 0.0 / --samples 1 (defaults) reproduce the original greedy,
+    single-shot behavior exactly -- nothing about a normal sweep changes.
+    Greedy decoding only catches quantization noise large enough to flip the
+    single most-likely token; it's blind to a model that's still *usually*
+    right but less confident than it used to be. --samples N (N>1) runs each
+    test case N times at --temperature and reports the fraction that scored
+    >= 1.0 instead of one pass/fail -- that fraction is where reduced
+    confidence actually becomes visible. Use a DIFFERENT --checkpoint file
+    than your production sweep uses; already_done() has no concept of sample
+    count and will silently skip a case a single-shot run already covers.
 
 Filler corpus:
     Haystack filler is streamed from the wikimedia/wikipedia HF dataset
@@ -42,7 +56,7 @@ from __future__ import annotations
 import argparse, json, os, random, re, time
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Dict, List, Optional, Tuple
 
 import requests
 from dotenv import load_dotenv
@@ -59,6 +73,8 @@ TIMEOUT     = int(os.getenv("EVAL_TIMEOUT", "10800"))
 MAX_TOKENS  = int(os.getenv("EVAL_MAX_TOKENS", "256"))
 RETRIES     = int(os.getenv("EVAL_RETRIES", "0"))
 RETRY_WAIT  = int(os.getenv("EVAL_RETRY_WAIT", "5"))
+TEMPERATURE = 0.0   # overridden by --temperature; 0.0 = greedy, matches all prior behavior
+N_SAMPLES   = 1      # overridden by --samples; 1 = single-shot, matches all prior behavior
 
 HEADERS = {"Content-Type": "application/json"}
 if API_KEY:
@@ -153,6 +169,54 @@ def _chat_with_retry(messages: List[Dict], max_tokens: int = MAX_TOKENS, tempera
                 time.sleep(RETRY_WAIT)
     assert last_err is not None
     raise last_err
+
+
+def _run_sampled(messages: List[Dict], score_fn, max_tokens: int, temperature: float,
+                  n_samples: int) -> Dict[str, Any]:
+    """
+    Runs the same request `n_samples` times at `temperature` and scores each
+    sample independently via score_fn(answer) -> float (0.0-1.0, same scale
+    as _score_exact/_score_partial).
+
+    This is the actual point of temperature > 0: at temperature=0 the model
+    is deterministic, so a "failure" only shows up if quantization noise is
+    large enough to flip the single most-likely token -- a high bar. Real
+    quality loss from lossy compression more often shows up as *reduced
+    confidence* in the correct answer (e.g. 95% probability mass on it
+    instead of 99.9%) without changing what the argmax token is, which
+    greedy decoding can never see. Sampling surfaces that as a pass RATE
+    across repeated draws instead of a single binary outcome -- a model
+    that's still well-calibrated should land close to 1.0 across samples;
+    one whose confidence has been eroded will start missing some fraction
+    of the time even though it "would have" gotten a single greedy call right.
+    A single sample at temperature > 0 tells you almost nothing on its own;
+    the signal is in the aggregate across n_samples, which is why this
+    doesn't return anything useful for n_samples == 1 -- use temperature=0
+    and a normal single-shot call for that instead.
+    """
+    sample_scores: List[float] = []
+    sample_answers: List[str] = []
+    n_errors = 0
+    t0 = time.time()
+    for _ in range(n_samples):
+        try:
+            result = _chat_with_retry(messages, max_tokens=max_tokens, temperature=temperature)
+            answer = result["answer"]
+            sample_scores.append(float(score_fn(answer)))
+            sample_answers.append(answer)
+        except Exception as e:
+            n_errors += 1
+            sample_answers.append(f"ERROR: {e}")
+    total_latency = time.time() - t0
+    n_ok = len(sample_scores)
+    pass_rate = (sum(1 for s in sample_scores if s >= 1.0) / n_ok) if n_ok else 0.0
+    avg_score = (sum(sample_scores) / n_ok) if n_ok else 0.0
+    return {
+        "pass_rate": pass_rate, "avg_score": avg_score,
+        "sample_scores": sample_scores, "sample_answers": sample_answers,
+        "n_ok": n_ok, "n_errors": n_errors,
+        "total_latency_s": total_latency,
+    }
 
 
 def count_tokens(text: str) -> Optional[int]:
@@ -389,6 +453,25 @@ def _pad_to_tokens(target_tokens: int) -> str:
         ratio = target_tokens / max(n, 1)
         words = make_words(int(len(words) * ratio) + 20)
 
+    # The loop above only ever guaranteed "at least target_tokens" -- there
+    # was no corresponding check for overshooting it. If the real corpus
+    # tokenizes denser than the 1.3-tokens/word estimate (plausible for
+    # Wikipedia-derived text -- proper nouns, foreign names, and technical
+    # terms all split into more subword tokens than generic prose), the
+    # very first grown batch can already sail past target and just gets
+    # accepted as-is. Invisible with headroom to spare below a hard ctx
+    # ceiling; not invisible when the target is close to that ceiling --
+    # this is what turned a nominal 2K-token safety margin at 260000/262144
+    # into a real 8-12K token overshoot. Trim back down for real.
+    n = count_tokens(" ".join(words))
+    if n is not None and n > target_tokens:
+        words = words[: max(1, int(len(words) * (target_tokens / n)))]
+        for _ in range(3):
+            n = count_tokens(" ".join(words))
+            if n is None or n <= target_tokens:
+                break
+            words = words[: max(1, int(len(words) * 0.99))]
+
     return " ".join(words)
 
 
@@ -550,7 +633,8 @@ class ResultTracker:
                 print(f"[checkpt] Resumed: {len(self.results)} prior results loaded")
 
     def add(self, suite: str, ctx_len: int, test_name: str, passed: bool,
-            score: float, latency_s: float, details: str = "", is_error: bool = False):
+            score: float, latency_s: float, details: str = "", is_error: bool = False,
+            extra: Optional[Dict[str, Any]] = None):
         entry = {
             "suite": suite, "ctx_len": ctx_len, "test": test_name,
             "passed": passed, "score": round(score, 3),
@@ -558,6 +642,11 @@ class ResultTracker:
             "is_error": is_error,
             "ts": datetime.now(timezone.utc).isoformat(),
         }
+        if extra:
+            entry.update(extra)  # e.g. sample_scores/sample_answers/n_samples/temperature
+                                  # for a sampled run -- additive only, existing readers
+                                  # (summary(), render_niah_heatmap()) only ever look at
+                                  # the core fields above and ignore anything extra.
         self.results.append(entry)
         status = "ERROR" if is_error else ("✅ PASS" if passed else "❌ FAIL")
         print(f"  {status} | {suite}/{test_name} @ {ctx_len//1000}K | "
@@ -602,47 +691,137 @@ class ResultTracker:
         print(f"\n[✓] Full report saved → {path}")
 
 
+# ─── NIAH heatmap ─────────────────────────────────────────────────────────────
+# Ported from niah_test.py (ShadowEngine's original dedicated NIAH grid+heatmap
+# script). Generalized to take a plain list of result dicts rather than only
+# working off a live run, so it also works standalone against an already-saved
+# checkpoint (a plain list) or report file (results under the "results" key) --
+# e.g. re-rendering a heatmap from a run that already finished.
+
+_NIAH_DEPTH_PCT = {"depth_start": 5, "depth_middle": 50, "depth_end": 95}
+
+
+def render_niah_heatmap(results: List[Dict[str, Any]], path: str = "niah_heatmap.png") -> bool:
+    """
+    Renders a context-length x needle-depth PASS/FAIL heatmap from `results`.
+    Returns True if a heatmap was written, False if skipped (no niah rows in
+    `results`, or matplotlib isn't available -- the JSON still has everything
+    needed to build one later either way).
+    """
+    niah_rows = [r for r in results if r.get("suite") == "niah" and not r.get("is_error")]
+    if not niah_rows:
+        print("[heatmap] No niah results found -- skipping.")
+        return False
+
+    try:
+        import matplotlib.pyplot as plt
+        import numpy as np
+    except ImportError:
+        print("[heatmap] matplotlib/numpy not available -- skipping heatmap.")
+        return False
+
+    ctx_lengths = sorted({r["ctx_len"] for r in niah_rows})
+    depths = sorted({_NIAH_DEPTH_PCT[r["test"]] for r in niah_rows if r["test"] in _NIAH_DEPTH_PCT})
+    if not ctx_lengths or not depths:
+        print("[heatmap] Could not determine ctx_len/depth axes from results -- skipping.")
+        return False
+
+    # NaN (not 0) for any (ctx_len, depth) cell that was never actually run --
+    # the original niah_test.py version defaulted missing cells to 0.0, which
+    # would silently render an untested cell identically to a real FAIL.
+    grid = np.full((len(depths), len(ctx_lengths)), np.nan)
+    for r in niah_rows:
+        if r["test"] not in _NIAH_DEPTH_PCT:
+            continue
+        i = depths.index(_NIAH_DEPTH_PCT[r["test"]])
+        j = ctx_lengths.index(r["ctx_len"])
+        grid[i, j] = 1.0 if r["passed"] else 0.0
+
+    fig, ax = plt.subplots(figsize=(1.6 * len(ctx_lengths) + 2, 1.0 * len(depths) + 2))
+    im = ax.imshow(grid, cmap="RdYlGn", vmin=0, vmax=1, aspect="auto")
+    ax.set_xticks(range(len(ctx_lengths)))
+    ax.set_xticklabels([f"{c // 1000}K" for c in ctx_lengths])
+    ax.set_yticks(range(len(depths)))
+    ax.set_yticklabels([f"{d}%" for d in depths])
+    ax.set_xlabel("Context length")
+    ax.set_ylabel("Needle depth")
+    ax.set_title("NIAH retrieval — q4_0 KV cache")
+
+    for i in range(len(depths)):
+        for j in range(len(ctx_lengths)):
+            val = grid[i, j]
+            if np.isnan(val):
+                ax.text(j, i, "—", ha="center", va="center", fontsize=8, color="gray")
+            else:
+                ax.text(j, i, "PASS" if val else "FAIL", ha="center", va="center",
+                        fontsize=8, color="black" if val else "white")
+
+    fig.colorbar(im, ax=ax, label="1 = retrieved, 0 = missed")
+    fig.tight_layout()
+    fig.savefig(path, dpi=150)
+    plt.close(fig)
+    print(f"[heatmap] Saved → {path}")
+    return True
+
+
 # ─── Suite 1: Basic NIAH ─────────────────────────────────────────────────────
 
-NIAH_NEEDLES = [
-    ("The secret code is DELTA-7749.", "DELTA-7749"),
-    ("The launch password is AURORA-PRIME.", "AURORA-PRIME"),
-    ("The hidden phrase is CRIMSON-FALCON.", "CRIMSON-FALCON"),
-]
+# A fresh random code every call (ported from niah_test.py) rather than
+# reusing one static string ("DELTA-7749") for every test -- the model can
+# never pattern-match a memorized answer, which is the more rigorous design.
+_NIAH_CODE_WORDS = ["DELTA", "AURORA", "CRIMSON", "ZENITH", "PHANTOM", "SIGMA"]
+
+def _make_niah_needle() -> Tuple[str, str]:
+    word = random.choice(_NIAH_CODE_WORDS)
+    digits = "".join(random.choices("0123456789", k=4))
+    code = f"{word}-{digits}"
+    return f"The secret code is {code}.", code
 
 def run_niah(tracker: ResultTracker, ctx_len: int):
     suite = "niah"
     for depth_name, position in [("start", 0.05), ("middle", 0.50), ("end", 0.95)]:
-        for needle_text, expected in NIAH_NEEDLES[:1]:
-            test_name = f"depth_{depth_name}"
-            if tracker.already_done(suite, ctx_len, test_name):
-                print(f"  [skip] {suite}/{test_name} @ {ctx_len//1000}K"); continue
-            filler = _build_filler_avoiding(ctx_len - 200, [expected])
-            context = _inject_needle(filler, needle_text, position)
-            messages = [
-                {"role": "system", "content": "Answer with ONLY the exact value asked for. No explanation."},
-                {"role": "user",   "content": f"{context}\n\nWhat is the secret code mentioned in the text?"},
-            ]
-            t0 = time.time()
-            try:
-                result = _chat_with_retry(messages)
+        test_name = f"depth_{depth_name}"
+        if tracker.already_done(suite, ctx_len, test_name):
+            print(f"  [skip] {suite}/{test_name} @ {ctx_len//1000}K"); continue
+        needle_text, expected = _make_niah_needle()
+        filler = _build_filler_avoiding(ctx_len - 200, [expected])
+        context = _inject_needle(filler, needle_text, position)
+        messages = [
+            {"role": "system", "content": "Answer with ONLY the exact value asked for. No explanation."},
+            {"role": "user",   "content": f"{context}\n\nWhat is the secret code mentioned in the text?"},
+        ]
+        t0 = time.time()
+        try:
+            if N_SAMPLES > 1:
+                sampled = _run_sampled(messages, lambda ans: float(_score_exact(ans, expected)),
+                                        MAX_TOKENS, TEMPERATURE, N_SAMPLES)
+                n_hit = sum(1 for s in sampled["sample_scores"] if s >= 1.0)
+                tracker.add(suite, ctx_len, test_name, sampled["pass_rate"] >= 1.0, sampled["pass_rate"],
+                            sampled["total_latency_s"],
+                            f"expected={expected!r} | pass_rate={sampled['pass_rate']:.2f} "
+                            f"({n_hit}/{N_SAMPLES}) | temp={TEMPERATURE} | errors={sampled['n_errors']}",
+                            extra={"n_samples": N_SAMPLES, "temperature": TEMPERATURE,
+                                   "sample_scores": sampled["sample_scores"],
+                                   "sample_answers": sampled["sample_answers"]})
+            else:
+                result = _chat_with_retry(messages, temperature=TEMPERATURE)
                 latency = time.time() - t0
                 answer = result["answer"]
                 passed = _score_exact(answer, expected)
                 tracker.add(suite, ctx_len, test_name, passed, float(passed), latency,
                             f"expected={expected!r} | got={answer[:80]!r} | finish={result['finish_reason']}")
-            except Exception as e:
-                tracker.add(suite, ctx_len, test_name, False, 0.0, time.time() - t0,
-                            f"ERROR: {e}", is_error=True)
+        except Exception as e:
+            tracker.add(suite, ctx_len, test_name, False, 0.0, time.time() - t0,
+                        f"ERROR: {e}", is_error=True)
 
 
 # ─── Suite 2: Multi-Needle ───────────────────────────────────────────────────
 
 MULTI_NEEDLES = [
-    ("The Alpha key value is 1847.", "1847"),
-    ("The Beta key value is 5293.",  "5293"),
-    ("The Gamma key value is 7761.", "7761"),
-    ("The Delta key value is 3042.", "3042"),
+    ("Alpha", "The Alpha key value is 1847.", "1847"),
+    ("Beta",  "The Beta key value is 5293.",  "5293"),
+    ("Gamma", "The Gamma key value is 7761.", "7761"),
+    ("Delta", "The Delta key value is 3042.", "3042"),
 ]
 
 def run_multi_needle(tracker: ResultTracker, ctx_len: int):
@@ -652,11 +831,19 @@ def run_multi_needle(tracker: ResultTracker, ctx_len: int):
         if tracker.already_done(suite, ctx_len, test_name):
             print(f"  [skip] {suite}/{test_name} @ {ctx_len//1000}K"); continue
         needles = MULTI_NEEDLES[:n_needles]
-        expected_values = [v for _, v in needles]
+        labels = [label for label, _, _ in needles]
+        expected_values = [v for _, _, v in needles]
         filler = _build_filler_avoiding(ctx_len - 300 * n_needles, expected_values)
-        for i, (needle_text, _) in enumerate(needles):
+        for i, (_, needle_text, _) in enumerate(needles):
             filler = _inject_needle(filler, needle_text, (i + 1) / (n_needles + 1))
-        query = ("List ALL key values mentioned in the text (Alpha, Beta, Gamma, Delta). "
+        # Built from `labels`, not hardcoded -- the query used to always say
+        # "(Alpha, Beta, Gamma, Delta)" even for the 2-needle case, where only
+        # Alpha and Beta were actually present. Telling the model to find 4
+        # things when 2 exist is a genuinely confusing prompt, and it's the
+        # likely cause of the one real-run failure at 196K (the model echoed
+        # the label words straight out of the query instead of retrieving
+        # values) rather than clean evidence of retrieval failure.
+        query = (f"List ALL key values mentioned in the text ({', '.join(labels)}). "
                  "Return only the numbers, one per line.")
         messages = [
             {"role": "system", "content": "Extract and list ONLY the exact values. No explanation."},
@@ -664,13 +851,25 @@ def run_multi_needle(tracker: ResultTracker, ctx_len: int):
         ]
         t0 = time.time()
         try:
-            result = _chat_with_retry(messages, max_tokens=128)
-            latency = time.time() - t0
-            answer = result["answer"]
-            score = _score_partial(answer, expected_values)
-            tracker.add(suite, ctx_len, test_name, score >= 0.75, score, latency,
-                        f"expected={expected_values} | score={score:.2f} | got={answer[:200]!r} | "
-                        f"finish={result['finish_reason']}")
+            if N_SAMPLES > 1:
+                sampled = _run_sampled(messages, lambda ans: _score_partial(ans, expected_values),
+                                        128, TEMPERATURE, N_SAMPLES)
+                n_hit = sum(1 for s in sampled["sample_scores"] if s >= 1.0)
+                tracker.add(suite, ctx_len, test_name, sampled["pass_rate"] >= 1.0, sampled["pass_rate"],
+                            sampled["total_latency_s"],
+                            f"expected={expected_values} | pass_rate={sampled['pass_rate']:.2f} "
+                            f"({n_hit}/{N_SAMPLES}) | temp={TEMPERATURE} | errors={sampled['n_errors']}",
+                            extra={"n_samples": N_SAMPLES, "temperature": TEMPERATURE,
+                                   "sample_scores": sampled["sample_scores"],
+                                   "sample_answers": sampled["sample_answers"]})
+            else:
+                result = _chat_with_retry(messages, max_tokens=128, temperature=TEMPERATURE)
+                latency = time.time() - t0
+                answer = result["answer"]
+                score = _score_partial(answer, expected_values)
+                tracker.add(suite, ctx_len, test_name, score >= 0.75, score, latency,
+                            f"expected={expected_values} | score={score:.2f} | got={answer[:200]!r} | "
+                            f"finish={result['finish_reason']}")
         except Exception as e:
             tracker.add(suite, ctx_len, test_name, False, 0.0, time.time() - t0,
                         f"ERROR: {e}", is_error=True)
@@ -713,12 +912,24 @@ def run_nolima(tracker: ResultTracker, ctx_len: int):
         ]
         t0 = time.time()
         try:
-            result = _chat_with_retry(messages)
-            latency = time.time() - t0
-            answer = result["answer"]
-            score = _score_partial(answer, case["keywords"])
-            tracker.add(suite, ctx_len, test_name, score >= 1.0, score, latency,
-                        f"keywords={case['keywords']} | got={answer[:200]!r} | finish={result['finish_reason']}")
+            if N_SAMPLES > 1:
+                sampled = _run_sampled(messages, lambda ans: _score_partial(ans, case["keywords"]),
+                                        MAX_TOKENS, TEMPERATURE, N_SAMPLES)
+                n_hit = sum(1 for s in sampled["sample_scores"] if s >= 1.0)
+                tracker.add(suite, ctx_len, test_name, sampled["pass_rate"] >= 1.0, sampled["pass_rate"],
+                            sampled["total_latency_s"],
+                            f"keywords={case['keywords']} | pass_rate={sampled['pass_rate']:.2f} "
+                            f"({n_hit}/{N_SAMPLES}) | temp={TEMPERATURE} | errors={sampled['n_errors']}",
+                            extra={"n_samples": N_SAMPLES, "temperature": TEMPERATURE,
+                                   "sample_scores": sampled["sample_scores"],
+                                   "sample_answers": sampled["sample_answers"]})
+            else:
+                result = _chat_with_retry(messages, temperature=TEMPERATURE)
+                latency = time.time() - t0
+                answer = result["answer"]
+                score = _score_partial(answer, case["keywords"])
+                tracker.add(suite, ctx_len, test_name, score >= 1.0, score, latency,
+                            f"keywords={case['keywords']} | got={answer[:200]!r} | finish={result['finish_reason']}")
         except Exception as e:
             tracker.add(suite, ctx_len, test_name, False, 0.0, time.time() - t0,
                         f"ERROR: {e}", is_error=True)
@@ -762,12 +973,24 @@ def run_ruler(tracker: ResultTracker, ctx_len: int):
         ]
         t0 = time.time()
         try:
-            result = _chat_with_retry(messages)
-            latency = time.time() - t0
-            answer = result["answer"]
-            score = _score_partial(answer, case["keywords"])
-            tracker.add(suite, ctx_len, test_name, score >= 1.0, score, latency,
-                        f"keywords={case['keywords']} | got={answer[:200]!r} | finish={result['finish_reason']}")
+            if N_SAMPLES > 1:
+                sampled = _run_sampled(messages, lambda ans: _score_partial(ans, case["keywords"]),
+                                        MAX_TOKENS, TEMPERATURE, N_SAMPLES)
+                n_hit = sum(1 for s in sampled["sample_scores"] if s >= 1.0)
+                tracker.add(suite, ctx_len, test_name, sampled["pass_rate"] >= 1.0, sampled["pass_rate"],
+                            sampled["total_latency_s"],
+                            f"keywords={case['keywords']} | pass_rate={sampled['pass_rate']:.2f} "
+                            f"({n_hit}/{N_SAMPLES}) | temp={TEMPERATURE} | errors={sampled['n_errors']}",
+                            extra={"n_samples": N_SAMPLES, "temperature": TEMPERATURE,
+                                   "sample_scores": sampled["sample_scores"],
+                                   "sample_answers": sampled["sample_answers"]})
+            else:
+                result = _chat_with_retry(messages, temperature=TEMPERATURE)
+                latency = time.time() - t0
+                answer = result["answer"]
+                score = _score_partial(answer, case["keywords"])
+                tracker.add(suite, ctx_len, test_name, score >= 1.0, score, latency,
+                            f"keywords={case['keywords']} | got={answer[:200]!r} | finish={result['finish_reason']}")
         except Exception as e:
             tracker.add(suite, ctx_len, test_name, False, 0.0, time.time() - t0,
                         f"ERROR: {e}", is_error=True)
@@ -814,12 +1037,24 @@ def run_babilong(tracker: ResultTracker, ctx_len: int):
         ]
         t0 = time.time()
         try:
-            result = _chat_with_retry(messages, max_tokens=512)
-            latency = time.time() - t0
-            answer = result["answer"]
-            score = _score_partial(answer, case["keywords"])
-            tracker.add(suite, ctx_len, test_name, score >= 1.0, score, latency,
-                        f"keywords={case['keywords']} | got={answer[:500]!r} | finish={result['finish_reason']}")
+            if N_SAMPLES > 1:
+                sampled = _run_sampled(messages, lambda ans: _score_partial(ans, case["keywords"]),
+                                        512, TEMPERATURE, N_SAMPLES)
+                n_hit = sum(1 for s in sampled["sample_scores"] if s >= 1.0)
+                tracker.add(suite, ctx_len, test_name, sampled["pass_rate"] >= 1.0, sampled["pass_rate"],
+                            sampled["total_latency_s"],
+                            f"keywords={case['keywords']} | pass_rate={sampled['pass_rate']:.2f} "
+                            f"({n_hit}/{N_SAMPLES}) | temp={TEMPERATURE} | errors={sampled['n_errors']}",
+                            extra={"n_samples": N_SAMPLES, "temperature": TEMPERATURE,
+                                   "sample_scores": sampled["sample_scores"],
+                                   "sample_answers": sampled["sample_answers"]})
+            else:
+                result = _chat_with_retry(messages, max_tokens=512, temperature=TEMPERATURE)
+                latency = time.time() - t0
+                answer = result["answer"]
+                score = _score_partial(answer, case["keywords"])
+                tracker.add(suite, ctx_len, test_name, score >= 1.0, score, latency,
+                            f"keywords={case['keywords']} | got={answer[:500]!r} | finish={result['finish_reason']}")
         except Exception as e:
             tracker.add(suite, ctx_len, test_name, False, 0.0, time.time() - t0,
                         f"ERROR: {e}", is_error=True)
@@ -836,7 +1071,7 @@ SUITE_MAP = {
 }
 
 def main():
-    global BASE_URL, MODEL
+    global BASE_URL, MODEL, TEMPERATURE, N_SAMPLES
     parser = argparse.ArgumentParser(description="ShadowEngine Long-Context Eval Suite")
     parser.add_argument("--ctx", nargs="+", type=int,
                         default=[32768, 65536, 131072, 192000],
@@ -854,14 +1089,39 @@ def main():
                         help="Size of the Wikipedia-derived filler pool (default: 20000).")
     parser.add_argument("--no-wiki", action="store_true",
                         help="Skip Wikipedia streaming; use the small static filler corpus instead.")
+    parser.add_argument("--temperature", type=float, default=0.0,
+                        help="Sampling temperature. 0.0 (default) = greedy, matches all prior "
+                             "behavior. Only meaningful combined with --samples > 1 -- a single "
+                             "sample at temperature > 0 tells you almost nothing on its own.")
+    parser.add_argument("--samples", type=int, default=1,
+                        help="Samples per test case. 1 (default) = single-shot, unchanged "
+                             "behavior. > 1 switches every suite to pass-rate scoring: each case "
+                             "is run N times and the result is the fraction that scored >= 1.0, "
+                             "not a single pass/fail. Costs N x the calls -- budget accordingly, "
+                             "especially at large context lengths.")
     args = parser.parse_args()
 
     global _WIKI_POOL_DISABLED
     _WIKI_POOL_DISABLED = args.no_wiki
 
-    BASE_URL = args.base_url
-    MODEL    = args.model
-    suites   = list(SUITE_MAP.keys()) if "all" in args.suite else args.suite
+    BASE_URL    = args.base_url
+    MODEL       = args.model
+    TEMPERATURE = args.temperature
+    N_SAMPLES   = max(1, args.samples)
+    suites      = list(SUITE_MAP.keys()) if "all" in args.suite else args.suite
+
+    if N_SAMPLES > 1 and TEMPERATURE == 0.0:
+        print("[!] WARNING: --samples > 1 with --temperature 0.0 -- greedy decoding is "
+              "deterministic, so every sample will be identical. This just multiplies your "
+              "call count for no new information. Set --temperature > 0 to actually get a "
+              "meaningful pass-rate spread, or drop --samples back to 1.\n")
+    if N_SAMPLES > 1 and args.checkpoint:
+        print(f"[!] WARNING: --samples > 1 with --checkpoint {args.checkpoint!r} -- "
+              f"already_done() keys on (suite, ctx_len, test) only, with no awareness of sample "
+              f"count or temperature. If this checkpoint already has single-shot entries for the "
+              f"same suite/ctx/test, they will be silently treated as done and skipped rather "
+              f"than re-run in sampled mode. Use a separate checkpoint file for sampled runs, "
+              f"not the one your production single-shot sweep uses.\n")
 
     print("=" * 62)
     print("  ShadowEngine — Long Context Evaluation Suite")
@@ -871,6 +1131,9 @@ def main():
     print(f"  Ctx lengths: {[f'{c//1000}K' for c in args.ctx]}")
     print(f"  Suites     : {suites}")
     print(f"  Checkpoint : {args.checkpoint or 'disabled'}")
+    if N_SAMPLES > 1:
+        print(f"  Sampling   : {N_SAMPLES} samples/case @ temperature={TEMPERATURE} "
+              f"(pass-rate mode)")
     print("=" * 62 + "\n")
 
     try:
@@ -919,6 +1182,7 @@ def main():
         ts   = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
         path = results_dir / f"report_{ts}.json"
         tracker.save_report(str(path))
+        render_niah_heatmap(tracker.results, str(results_dir / f"niah_heatmap_{ts}.png"))
 
 
 if __name__ == "__main__":
